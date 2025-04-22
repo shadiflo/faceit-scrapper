@@ -205,14 +205,19 @@ async function main() {
     await initializeSpreadsheet(sheetsClient);
 
     let totalAccounts = 0;
-    let allUsers = [];
 
-    // Process each pattern
+    // Process each pattern and save results after each pattern
     console.log('Starting pattern search...');
     for (const pattern of PATTERNS) {
       const users = await getAllUsersForPattern(pattern);
-      totalAccounts += users.length;
-      allUsers = [...allUsers, ...users];
+
+      if (users.length > 0) {
+        console.log(`Found ${users.length} accounts for pattern "${pattern}". Writing to spreadsheet...`);
+        await writeUsersToSheet(sheetsClient, users);
+        totalAccounts += users.length;
+      } else {
+        console.log(`No accounts found for pattern "${pattern}".`);
+      }
 
       // Add delay between patterns to respect rate limits
       await new Promise(resolve => setTimeout(resolve, 1000));
@@ -221,20 +226,29 @@ async function main() {
     // Now also search for numeric patterns (---TAKE_1 through ---TAKE_200)
     // Limiting to 200 for efficiency, you can increase this
     console.log('Starting numeric pattern search...');
-    for (let i = 1; i <= 200; i++) {
-      const pattern = `---TAKE_${i}`;
-      const users = await getAllUsersForPattern(pattern);
-      totalAccounts += users.length;
-      allUsers = [...allUsers, ...users];
 
-      // Add a small delay to respect rate limits
-      await new Promise(resolve => setTimeout(resolve, 300));
-    }
+    // Process in batches of 10 to avoid overwhelming the API
+    for (let batch = 1; batch <= 20; batch++) {
+      const startNumber = (batch - 1) * 10 + 1;
+      const endNumber = batch * 10;
 
-    // Write all users at once to the sheet
-    console.log(`Found ${totalAccounts} accounts total. Writing to spreadsheet...`);
-    if (allUsers.length > 0) {
-      await writeUsersToSheet(sheetsClient, allUsers);
+      console.log(`Searching batch ${batch}: ---TAKE_${startNumber} to ---TAKE_${endNumber}`);
+
+      for (let i = startNumber; i <= endNumber; i++) {
+        const pattern = `---TAKE_${i}`;
+        const users = await getAllUsersForPattern(pattern);
+
+        if (users.length > 0) {
+          console.log(`Found ${users.length} accounts for pattern "${pattern}". Writing to spreadsheet...`);
+          await writeUsersToSheet(sheetsClient, users);
+          totalAccounts += users.length;
+        }
+
+        // Add a small delay to respect rate limits
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+
+      console.log(`Completed batch ${batch}. Total accounts so far: ${totalAccounts}`);
     }
 
     console.log(`Completed! Found and saved ${totalAccounts} accounts total.`);
