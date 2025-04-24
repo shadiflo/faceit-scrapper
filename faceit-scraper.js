@@ -39,6 +39,14 @@ const faceitClient = axios.create({
   }
 });
 
+// Track processed user IDs to avoid duplicates
+const processedUserIds = new Set();
+let currentSheet = SHEET_NAME;
+let sheetIndex = 1;
+let totalAccountsSaved = 0;
+let batchBuffer = [];
+const BATCH_SIZE = 100; // Smaller batch size for more frequent updates
+
 // Initialize Google Sheets API with direct credentials
 async function getGoogleSheetsClient() {
   // Create JWT client using the provided credentials
@@ -87,14 +95,14 @@ function isValidBotNickname(nickname, basePattern) {
   return validFormat.test(remainingPart);
 }
 
-// Extract all valid bot accounts for a pattern (handles pagination)
-async function getAllValidBotsForPattern(basePattern, numberRange) {
+// Extract all valid bot accounts for a pattern and save them immediately
+async function processValidBotsForPattern(sheetsClient, basePattern, numberRange) {
   const pattern = `${basePattern}_${numberRange}`;
   console.log(`Searching for pattern: ${pattern}`);
 
   let offset = 0;
   const limit = 100;
-  let validBots = [];
+  let validBotsCount = 0;
   let hasMore = true;
 
   while (hasMore) {
@@ -106,10 +114,26 @@ async function getAllValidBotsForPattern(basePattern, numberRange) {
         isValidBotNickname(user.nickname, basePattern)
       );
 
-      validBots = [...validBots, ...validResults.map(user => ({
-        nickname: user.nickname,
-        userId: user.player_id
-      }))];
+      // Process new valid accounts (not seen before)
+      const newValidBots = validResults.filter(user => !processedUserIds.has(user.player_id))
+        .map(user => ({
+          userId: user.player_id,
+          nickname: user.nickname
+        }));
+
+      // Add to processed set
+      validResults.forEach(user => processedUserIds.add(user.player_id));
+
+      // Add new bots to our batch buffer
+      if (newValidBots.length > 0) {
+        batchBuffer.push(...newValidBots);
+        validBotsCount += newValidBots.length;
+
+        // If we've hit our batch size, write to sheet
+        if (batchBuffer.length >= BATCH_SIZE) {
+          await writeBufferedAccountsToSheet(sheetsClient);
+        }
+      }
 
       offset += limit;
 
@@ -119,13 +143,13 @@ async function getAllValidBotsForPattern(basePattern, numberRange) {
       // Add a delay to respect rate limits
       await new Promise(resolve => setTimeout(resolve, 500));
 
-      console.log(`Found ${validBots.length} valid bot accounts so far for pattern ${pattern}...`);
+      console.log(`Found ${validBotsCount} new valid bot accounts so far for pattern ${pattern}...`);
     } else {
       hasMore = false;
     }
   }
 
-  return validBots;
+  return validBotsCount;
 }
 
 // Initialize or clear the spreadsheet
@@ -181,120 +205,98 @@ async function initializeSpreadsheet(sheetsClient) {
   console.log('Added headers to the spreadsheet');
 }
 
-// Write users to Google Sheets with batch processing
-async function writeUsersToSheet(sheetsClient, users) {
-  if (users.length === 0) {
-    console.log('No users to write to the spreadsheet');
+// Write the currently buffered accounts to the spreadsheet
+async function writeBufferedAccountsToSheet(sheetsClient) {
+  if (batchBuffer.length === 0) {
     return;
   }
 
   // Convert users to rows format
-  const allRows = users.map(user => [
+  const rows = batchBuffer.map(user => [
     user.userId,
     user.nickname
   ]);
 
-  // Process in batches of 1000 rows at a time to avoid API limits
-  const BATCH_SIZE = 1000;
-  const batches = [];
-
-  for (let i = 0; i < allRows.length; i += BATCH_SIZE) {
-    batches.push(allRows.slice(i, i + BATCH_SIZE));
-  }
-
-  console.log(`Breaking data into ${batches.length} batches of up to ${BATCH_SIZE} rows each`);
-
-  // Process each batch
-  let totalProcessed = 0;
-  let currentSheet = SHEET_NAME;
-  let sheetIndex = 1;
-
-  for (let i = 0; i < batches.length; i++) {
-    const batch = batches[i];
-
-    try {
-      // Try to append the batch
-      await sheetsClient.spreadsheets.values.append({
-        spreadsheetId: SPREADSHEET_ID,
-        range: `${currentSheet}!A:B`,
-        valueInputOption: 'RAW',
-        resource: {
-          values: batch
-        }
-      });
-
-      totalProcessed += batch.length;
-      console.log(`Batch ${i+1}/${batches.length}: Added ${batch.length} accounts to ${currentSheet}`);
-
-    } catch (error) {
-      // If we hit a limit, create a new sheet and continue
-      if (error.message.includes('exceeds the limit') ||
-          error.message.includes('exceeds grid limits') ||
-          error.message.includes('range') ||
-          error.message.includes('limit')) {
-
-        console.log(`Sheet ${currentSheet} reached a limit. Creating a new sheet...`);
-
-        // Create a new sheet
-        sheetIndex++;
-        currentSheet = `${SHEET_NAME}_${sheetIndex}`;
-
-        try {
-          // Add the new sheet
-          await sheetsClient.spreadsheets.batchUpdate({
-            spreadsheetId: SPREADSHEET_ID,
-            resource: {
-              requests: [{
-                addSheet: {
-                  properties: {
-                    title: currentSheet
-                  }
-                }
-              }]
-            }
-          });
-
-          // Add headers to new sheet
-          await sheetsClient.spreadsheets.values.update({
-            spreadsheetId: SPREADSHEET_ID,
-            range: `${currentSheet}!A1:B1`,
-            valueInputOption: 'RAW',
-            resource: {
-              values: [['User ID', 'Nickname']]
-            }
-          });
-
-          console.log(`Created new sheet: ${currentSheet}`);
-
-          // Try to write this batch to the new sheet
-          await sheetsClient.spreadsheets.values.append({
-            spreadsheetId: SPREADSHEET_ID,
-            range: `${currentSheet}!A:B`,
-            valueInputOption: 'RAW',
-            resource: {
-              values: batch
-            }
-          });
-
-          totalProcessed += batch.length;
-          console.log(`Batch ${i+1}/${batches.length}: Added ${batch.length} accounts to ${currentSheet}`);
-
-        } catch (newSheetError) {
-          console.error(`Error creating or writing to new sheet: ${newSheetError.message}`);
-          throw newSheetError;
-        }
-      } else {
-        // If it's a different error, throw it
-        console.error(`Error writing batch ${i+1} to spreadsheet: ${error.message}`);
-        throw error;
+  try {
+    // Try to append the batch
+    await sheetsClient.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${currentSheet}!A:B`,
+      valueInputOption: 'RAW',
+      resource: {
+        values: rows
       }
-    }
+    });
 
-    // Add a small delay between batches to avoid rate limits
-    await new Promise(resolve => setTimeout(resolve, 100));
+    totalAccountsSaved += rows.length;
+    console.log(`Added ${rows.length} accounts to ${currentSheet} (Total saved: ${totalAccountsSaved})`);
+
+  } catch (error) {
+    // If we hit a limit, create a new sheet and continue
+    if (error.message.includes('exceeds the limit') ||
+        error.message.includes('exceeds grid limits') ||
+        error.message.includes('range') ||
+        error.message.includes('limit')) {
+
+      console.log(`Sheet ${currentSheet} reached a limit. Creating a new sheet...`);
+
+      // Create a new sheet
+      sheetIndex++;
+      currentSheet = `${SHEET_NAME}_${sheetIndex}`;
+
+      try {
+        // Add the new sheet
+        await sheetsClient.spreadsheets.batchUpdate({
+          spreadsheetId: SPREADSHEET_ID,
+          resource: {
+            requests: [{
+              addSheet: {
+                properties: {
+                  title: currentSheet
+                }
+              }
+            }]
+          }
+        });
+
+        // Add headers to new sheet
+        await sheetsClient.spreadsheets.values.update({
+          spreadsheetId: SPREADSHEET_ID,
+          range: `${currentSheet}!A1:B1`,
+          valueInputOption: 'RAW',
+          resource: {
+            values: [['User ID', 'Nickname']]
+          }
+        });
+
+        console.log(`Created new sheet: ${currentSheet}`);
+
+        // Try to write this batch to the new sheet
+        await sheetsClient.spreadsheets.values.append({
+          spreadsheetId: SPREADSHEET_ID,
+          range: `${currentSheet}!A:B`,
+          valueInputOption: 'RAW',
+          resource: {
+            values: rows
+          }
+        });
+
+        totalAccountsSaved += rows.length;
+        console.log(`Added ${rows.length} accounts to ${currentSheet} (Total saved: ${totalAccountsSaved})`);
+
+      } catch (newSheetError) {
+        console.error(`Error creating or writing to new sheet: ${newSheetError.message}`);
+        throw newSheetError;
+      }
+    } else {
+      // If it's a different error, throw it
+      console.error(`Error writing batch to spreadsheet: ${error.message}`);
+      throw error;
+    }
   }
 
-  console.log(`Successfully added ${totalProcessed} accounts to the spreadsheet(s).`);
+  // Clear the buffer after successful write
+  batchBuffer = [];
 }
 
 // Main function
@@ -312,8 +314,7 @@ async function main() {
     // Initialize spreadsheet
     await initializeSpreadsheet(sheetsClient);
 
-    let totalAccounts = 0;
-    let allValidBots = [];
+    let totalAccountsFound = 0;
 
     // Search for each pattern with different number ranges
     for (const basePattern of BASE_PATTERNS) {
@@ -330,11 +331,11 @@ async function main() {
 
       // Search for each pattern + number range combination
       for (const numberRange of numberRanges) {
-        const validBots = await getAllValidBotsForPattern(basePattern, numberRange);
+        const validBotsCount = await processValidBotsForPattern(sheetsClient, basePattern, numberRange);
 
-        if (validBots.length > 0) {
-          allValidBots = [...allValidBots, ...validBots];
-          console.log(`Found ${validBots.length} valid bot accounts for ${basePattern}_${numberRange}`);
+        if (validBotsCount > 0) {
+          totalAccountsFound += validBotsCount;
+          console.log(`Found ${validBotsCount} valid bot accounts for ${basePattern}_${numberRange}`);
         }
 
         // Add a delay between searches to respect rate limits
@@ -342,20 +343,27 @@ async function main() {
       }
     }
 
-    // Remove any duplicates by userId
-    const uniqueBots = Array.from(
-      new Map(allValidBots.map(bot => [bot.userId, bot])).values()
-    );
+    // Flush any remaining accounts in the buffer
+    if (batchBuffer.length > 0) {
+      await writeBufferedAccountsToSheet(sheetsClient);
+    }
 
-    console.log(`Found ${uniqueBots.length} unique valid bot accounts total.`);
-
-    // Write all valid bots to the spreadsheet
-    await writeUsersToSheet(sheetsClient, uniqueBots);
-
-    console.log(`Completed! Found and saved ${uniqueBots.length} bot accounts total.`);
+    console.log(`Completed! Found and saved ${totalAccountsFound} unique bot accounts total.`);
+    console.log(`Total accounts in spreadsheet: ${totalAccountsSaved}`);
 
   } catch (error) {
     console.error('Error in main process:', error);
+
+    // Try to save any remaining accounts in the buffer
+    try {
+      if (batchBuffer.length > 0) {
+        const sheetsClient = await getGoogleSheetsClient();
+        await writeBufferedAccountsToSheet(sheetsClient);
+        console.log('Saved remaining accounts before exit.');
+      }
+    } catch (finalSaveError) {
+      console.error('Error in final save attempt:', finalSaveError);
+    }
   }
 }
 
