@@ -1,4 +1,4 @@
-// faceit-scraper.js
+// improved-faceit-scraper.js
 const axios = require('axios');
 const { google } = require('googleapis');
 const { JWT } = require('google-auth-library');
@@ -11,8 +11,8 @@ const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n');
 const SHEET_NAME = 'BotAccounts';
 
-// Patterns to search for
-const PATTERNS = [
+// Base patterns to search for
+const BASE_PATTERNS = [
   '---TAKE',
   '---hiELO',
   '---MyELO',
@@ -26,7 +26,8 @@ const PATTERNS = [
   '---oELO',
   '---youELO',
   '---ELOOO',
-  '---Up-ELO'
+  '---Up-ELO',
+  '---TakeIt'
 ];
 
 // Faceit API client
@@ -54,7 +55,7 @@ async function getGoogleSheetsClient() {
   return google.sheets({ version: 'v4', auth: jwtClient });
 }
 
-// Search for users with a specific pattern
+// Search for users with a specific pattern + number
 async function searchUsers(pattern, offset = 0, limit = 100) {
   try {
     const response = await faceitClient.get('/search/players', {
@@ -72,20 +73,44 @@ async function searchUsers(pattern, offset = 0, limit = 100) {
   }
 }
 
-// Extract all users for a pattern (handles pagination)
-async function getAllUsersForPattern(pattern) {
+// Function to validate if a nickname matches our exact bot pattern format
+function isValidBotNickname(nickname, basePattern) {
+  // Check if nickname starts with our base pattern
+  if (!nickname.startsWith(basePattern)) {
+    return false;
+  }
+
+  // Valid format is basePattern + "_" + numbers
+  const remainingPart = nickname.substring(basePattern.length);
+  const validFormat = /^_\d+$/;
+
+  return validFormat.test(remainingPart);
+}
+
+// Extract all valid bot accounts for a pattern (handles pagination)
+async function getAllValidBotsForPattern(basePattern, numberRange) {
+  const pattern = `${basePattern}_${numberRange}`;
   console.log(`Searching for pattern: ${pattern}`);
 
   let offset = 0;
   const limit = 100;
-  let allUsers = [];
+  let validBots = [];
   let hasMore = true;
 
   while (hasMore) {
     const result = await searchUsers(pattern, offset, limit);
 
     if (result.items && result.items.length > 0) {
-      allUsers = [...allUsers, ...result.items];
+      // Filter the results to only include valid bot accounts
+      const validResults = result.items.filter(user =>
+        isValidBotNickname(user.nickname, basePattern)
+      );
+
+      validBots = [...validBots, ...validResults.map(user => ({
+        nickname: user.nickname,
+        userId: user.player_id
+      }))];
+
       offset += limit;
 
       // Check if we've reached the end
@@ -94,17 +119,13 @@ async function getAllUsersForPattern(pattern) {
       // Add a delay to respect rate limits
       await new Promise(resolve => setTimeout(resolve, 500));
 
-      console.log(`Found ${allUsers.length} accounts so far for pattern ${pattern}...`);
+      console.log(`Found ${validBots.length} valid bot accounts so far for pattern ${pattern}...`);
     } else {
       hasMore = false;
     }
   }
 
-  // Only return nickname and player_id
-  return allUsers.map(user => ({
-    nickname: user.nickname,
-    userId: user.player_id
-  }));
+  return validBots;
 }
 
 // Initialize or clear the spreadsheet
@@ -160,33 +181,120 @@ async function initializeSpreadsheet(sheetsClient) {
   console.log('Added headers to the spreadsheet');
 }
 
-// Write users to Google Sheets
+// Write users to Google Sheets with batch processing
 async function writeUsersToSheet(sheetsClient, users) {
   if (users.length === 0) {
     console.log('No users to write to the spreadsheet');
     return;
   }
 
-  const rows = users.map(user => [
+  // Convert users to rows format
+  const allRows = users.map(user => [
     user.userId,
     user.nickname
   ]);
 
-  try {
-    await sheetsClient.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${SHEET_NAME}!A:B`,
-      valueInputOption: 'RAW',
-      resource: {
-        values: rows
-      }
-    });
+  // Process in batches of 1000 rows at a time to avoid API limits
+  const BATCH_SIZE = 1000;
+  const batches = [];
 
-    console.log(`Successfully added ${users.length} accounts to the spreadsheet.`);
-  } catch (error) {
-    console.error(`Error writing to spreadsheet: ${error.message}`);
-    throw error;
+  for (let i = 0; i < allRows.length; i += BATCH_SIZE) {
+    batches.push(allRows.slice(i, i + BATCH_SIZE));
   }
+
+  console.log(`Breaking data into ${batches.length} batches of up to ${BATCH_SIZE} rows each`);
+
+  // Process each batch
+  let totalProcessed = 0;
+  let currentSheet = SHEET_NAME;
+  let sheetIndex = 1;
+
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+
+    try {
+      // Try to append the batch
+      await sheetsClient.spreadsheets.values.append({
+        spreadsheetId: SPREADSHEET_ID,
+        range: `${currentSheet}!A:B`,
+        valueInputOption: 'RAW',
+        resource: {
+          values: batch
+        }
+      });
+
+      totalProcessed += batch.length;
+      console.log(`Batch ${i+1}/${batches.length}: Added ${batch.length} accounts to ${currentSheet}`);
+
+    } catch (error) {
+      // If we hit a limit, create a new sheet and continue
+      if (error.message.includes('exceeds the limit') ||
+          error.message.includes('exceeds grid limits') ||
+          error.message.includes('range') ||
+          error.message.includes('limit')) {
+
+        console.log(`Sheet ${currentSheet} reached a limit. Creating a new sheet...`);
+
+        // Create a new sheet
+        sheetIndex++;
+        currentSheet = `${SHEET_NAME}_${sheetIndex}`;
+
+        try {
+          // Add the new sheet
+          await sheetsClient.spreadsheets.batchUpdate({
+            spreadsheetId: SPREADSHEET_ID,
+            resource: {
+              requests: [{
+                addSheet: {
+                  properties: {
+                    title: currentSheet
+                  }
+                }
+              }]
+            }
+          });
+
+          // Add headers to new sheet
+          await sheetsClient.spreadsheets.values.update({
+            spreadsheetId: SPREADSHEET_ID,
+            range: `${currentSheet}!A1:B1`,
+            valueInputOption: 'RAW',
+            resource: {
+              values: [['User ID', 'Nickname']]
+            }
+          });
+
+          console.log(`Created new sheet: ${currentSheet}`);
+
+          // Try to write this batch to the new sheet
+          await sheetsClient.spreadsheets.values.append({
+            spreadsheetId: SPREADSHEET_ID,
+            range: `${currentSheet}!A:B`,
+            valueInputOption: 'RAW',
+            resource: {
+              values: batch
+            }
+          });
+
+          totalProcessed += batch.length;
+          console.log(`Batch ${i+1}/${batches.length}: Added ${batch.length} accounts to ${currentSheet}`);
+
+        } catch (newSheetError) {
+          console.error(`Error creating or writing to new sheet: ${newSheetError.message}`);
+          throw newSheetError;
+        }
+      } else {
+        // If it's a different error, throw it
+        console.error(`Error writing batch ${i+1} to spreadsheet: ${error.message}`);
+        throw error;
+      }
+    }
+
+    // Add a small delay between batches to avoid rate limits
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+
+  console.log(`Successfully added ${totalProcessed} accounts to the spreadsheet(s).`);
 }
 
 // Main function
@@ -205,53 +313,46 @@ async function main() {
     await initializeSpreadsheet(sheetsClient);
 
     let totalAccounts = 0;
+    let allValidBots = [];
 
-    // Process each pattern and save results after each pattern
-    console.log('Starting pattern search...');
-    for (const pattern of PATTERNS) {
-      const users = await getAllUsersForPattern(pattern);
+    // Search for each pattern with different number ranges
+    for (const basePattern of BASE_PATTERNS) {
+      console.log(`Processing base pattern: ${basePattern}`);
 
-      if (users.length > 0) {
-        console.log(`Found ${users.length} accounts for pattern "${pattern}". Writing to spreadsheet...`);
-        await writeUsersToSheet(sheetsClient, users);
-        totalAccounts += users.length;
-      } else {
-        console.log(`No accounts found for pattern "${pattern}".`);
+      // Define number ranges to search in batches
+      const numberRanges = ['', '*']; // Empty string for general search, * as wildcard
+
+      // Also add numeric ranges (searching in batches)
+      for (let i = 1; i <= 400; i += 20) {
+        const rangeEnd = Math.min(i + 19, 400);
+        numberRanges.push(`${i}-${rangeEnd}`);
       }
 
-      // Add delay between patterns to respect rate limits
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    }
+      // Search for each pattern + number range combination
+      for (const numberRange of numberRanges) {
+        const validBots = await getAllValidBotsForPattern(basePattern, numberRange);
 
-    // Now also search for numeric patterns (---TAKE_1 through ---TAKE_200)
-    // Limiting to 200 for efficiency, you can increase this
-    console.log('Starting numeric pattern search...');
-
-    // Process in batches of 10 to avoid overwhelming the API
-    for (let batch = 1; batch <= 20; batch++) {
-      const startNumber = (batch - 1) * 10 + 1;
-      const endNumber = batch * 10;
-
-      console.log(`Searching batch ${batch}: ---TAKE_${startNumber} to ---TAKE_${endNumber}`);
-
-      for (let i = startNumber; i <= endNumber; i++) {
-        const pattern = `---TAKE_${i}`;
-        const users = await getAllUsersForPattern(pattern);
-
-        if (users.length > 0) {
-          console.log(`Found ${users.length} accounts for pattern "${pattern}". Writing to spreadsheet...`);
-          await writeUsersToSheet(sheetsClient, users);
-          totalAccounts += users.length;
+        if (validBots.length > 0) {
+          allValidBots = [...allValidBots, ...validBots];
+          console.log(`Found ${validBots.length} valid bot accounts for ${basePattern}_${numberRange}`);
         }
 
-        // Add a small delay to respect rate limits
-        await new Promise(resolve => setTimeout(resolve, 300));
+        // Add a delay between searches to respect rate limits
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
-
-      console.log(`Completed batch ${batch}. Total accounts so far: ${totalAccounts}`);
     }
 
-    console.log(`Completed! Found and saved ${totalAccounts} accounts total.`);
+    // Remove any duplicates by userId
+    const uniqueBots = Array.from(
+      new Map(allValidBots.map(bot => [bot.userId, bot])).values()
+    );
+
+    console.log(`Found ${uniqueBots.length} unique valid bot accounts total.`);
+
+    // Write all valid bots to the spreadsheet
+    await writeUsersToSheet(sheetsClient, uniqueBots);
+
+    console.log(`Completed! Found and saved ${uniqueBots.length} bot accounts total.`);
 
   } catch (error) {
     console.error('Error in main process:', error);
