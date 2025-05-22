@@ -9,25 +9,19 @@ const FACEIT_API_KEY = process.env.FACEIT_API_KEY;
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n');
-const SHEET_NAME = 'BotAccounts';
+const SHEET_NAME = 'SHADI';
 
 // Base patterns to search for
 const BASE_PATTERNS = [
-  '---TAKE',
-  '---hiELO',
-  '---MyELO',
-  '---ggELO',
-  '---ELObst',
-  '---ELOg0d',
-  '---GOTIt',
-  '---topELO',
-  '---TakeIt',
-  '---ELOizi',
-  '---oELO',
-  '---youELO',
-  '---ELOOO',
-  '---Up-ELO',
-  '---TakeIt'
+  '---pr0ELO',
+  '---B00ST_',
+  '---EEELO_',
+  '---tytELO_',
+  '---ELO-EZ_',
+  '---EZ-ELO_',
+  '--BoostKD_',
+  '--ELOsh0p_',
+  '---forELO'
 ];
 
 // Faceit API client
@@ -302,7 +296,7 @@ async function writeBufferedAccountsToSheet(sheetsClient) {
 // Main function
 async function main() {
   try {
-    console.log('Starting Faceit account scraper...');
+    console.log('Starting Faceit account scraper for SHADI sheet...');
     console.log(`Using Faceit API key: ${FACEIT_API_KEY.slice(0, 5)}...`);
     console.log(`Using spreadsheet ID: ${SPREADSHEET_ID}`);
 
