@@ -38,8 +38,6 @@ const processedUserIds = new Set();
 let currentSheet = SHEET_NAME;
 let sheetIndex = 1;
 let totalAccountsSaved = 0;
-let batchBuffer = [];
-const BATCH_SIZE = 100; // Smaller batch size for more frequent updates
 
 // Initialize Google Sheets API with direct credentials
 async function getGoogleSheetsClient() {
@@ -118,14 +116,16 @@ async function processValidBotsForPattern(sheetsClient, basePattern, numberRange
       // Add to processed set
       validResults.forEach(user => processedUserIds.add(user.player_id));
 
-      // Add new bots to our batch buffer
+      // Add new bots to our batch buffer and save immediately
       if (newValidBots.length > 0) {
-        batchBuffer.push(...newValidBots);
-        validBotsCount += newValidBots.length;
+        // Log and save each bot as it's found
+        for (const bot of newValidBots) {
+          console.log(`🤖 FOUND BOT: ${bot.nickname} | User ID: ${bot.userId}`);
 
-        // If we've hit our batch size, write to sheet
-        if (batchBuffer.length >= BATCH_SIZE) {
-          await writeBufferedAccountsToSheet(sheetsClient);
+          // Save immediately to sheet
+          await saveImmediatelyToSheet(sheetsClient, bot);
+          validBotsCount++;
+          totalAccountsSaved++;
         }
       }
 
@@ -137,7 +137,9 @@ async function processValidBotsForPattern(sheetsClient, basePattern, numberRange
       // Add a delay to respect rate limits
       await new Promise(resolve => setTimeout(resolve, 500));
 
-      console.log(`Found ${validBotsCount} new valid bot accounts so far for pattern ${pattern}...`);
+      if (validBotsCount > 0) {
+        console.log(`📈 Found ${validBotsCount} valid bot accounts for pattern ${pattern}`);
+      }
     } else {
       hasMore = false;
     }
@@ -199,6 +201,87 @@ async function initializeSpreadsheet(sheetsClient) {
   console.log('Added headers to the spreadsheet');
 }
 
+// Write a single account immediately to the spreadsheet
+async function saveImmediatelyToSheet(sheetsClient, user) {
+  const row = [user.userId, user.nickname];
+
+  try {
+    // Try to append the single account
+    await sheetsClient.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${currentSheet}!A:B`,
+      valueInputOption: 'RAW',
+      resource: {
+        values: [row]
+      }
+    });
+
+    console.log(`✅ SAVED: ${user.nickname} to ${currentSheet} (Total: ${totalAccountsSaved + 1})`);
+
+  } catch (error) {
+    // If we hit a limit, create a new sheet and continue
+    if (error.message.includes('exceeds the limit') ||
+        error.message.includes('exceeds grid limits') ||
+        error.message.includes('range') ||
+        error.message.includes('limit')) {
+
+      console.log(`📄 Sheet ${currentSheet} reached limit. Creating new sheet...`);
+
+      // Create a new sheet
+      sheetIndex++;
+      currentSheet = `${SHEET_NAME}_${sheetIndex}`;
+
+      try {
+        // Add the new sheet
+        await sheetsClient.spreadsheets.batchUpdate({
+          spreadsheetId: SPREADSHEET_ID,
+          resource: {
+            requests: [{
+              addSheet: {
+                properties: {
+                  title: currentSheet
+                }
+              }
+            }]
+          }
+        });
+
+        // Add headers to new sheet
+        await sheetsClient.spreadsheets.values.update({
+          spreadsheetId: SPREADSHEET_ID,
+          range: `${currentSheet}!A1:B1`,
+          valueInputOption: 'RAW',
+          resource: {
+            values: [['User ID', 'Nickname']]
+          }
+        });
+
+        console.log(`✨ Created new sheet: ${currentSheet}`);
+
+        // Try to write this account to the new sheet
+        await sheetsClient.spreadsheets.values.append({
+          spreadsheetId: SPREADSHEET_ID,
+          range: `${currentSheet}!A:B`,
+          valueInputOption: 'RAW',
+          resource: {
+            values: [row]
+          }
+        });
+
+        console.log(`✅ SAVED: ${user.nickname} to ${currentSheet} (Total: ${totalAccountsSaved + 1})`);
+
+      } catch (newSheetError) {
+        console.error(`❌ Error creating or writing to new sheet: ${newSheetError.message}`);
+        throw newSheetError;
+      }
+    } else {
+      // If it's a different error, throw it
+      console.error(`❌ Error writing to spreadsheet: ${error.message}`);
+      throw error;
+    }
+  }
+}
+
 // Write the currently buffered accounts to the spreadsheet
 async function writeBufferedAccountsToSheet(sheetsClient) {
   if (batchBuffer.length === 0) {
@@ -223,7 +306,8 @@ async function writeBufferedAccountsToSheet(sheetsClient) {
     });
 
     totalAccountsSaved += rows.length;
-    console.log(`Added ${rows.length} accounts to ${currentSheet} (Total saved: ${totalAccountsSaved})`);
+    console.log(`💾 SAVED ${rows.length} accounts to ${currentSheet} (Total saved: ${totalAccountsSaved})`);
+    console.log(`📊 Latest batch saved to spreadsheet!`);
 
   } catch (error) {
     // If we hit a limit, create a new sheet and continue
@@ -276,7 +360,8 @@ async function writeBufferedAccountsToSheet(sheetsClient) {
         });
 
         totalAccountsSaved += rows.length;
-        console.log(`Added ${rows.length} accounts to ${currentSheet} (Total saved: ${totalAccountsSaved})`);
+        console.log(`💾 SAVED ${rows.length} accounts to ${currentSheet} (Total saved: ${totalAccountsSaved})`);
+        console.log(`📊 Latest batch saved to new spreadsheet!`);
 
       } catch (newSheetError) {
         console.error(`Error creating or writing to new sheet: ${newSheetError.message}`);
@@ -296,9 +381,10 @@ async function writeBufferedAccountsToSheet(sheetsClient) {
 // Main function
 async function main() {
   try {
-    console.log('Starting Faceit account scraper for SHADI sheet...');
-    console.log(`Using Faceit API key: ${FACEIT_API_KEY.slice(0, 5)}...`);
-    console.log(`Using spreadsheet ID: ${SPREADSHEET_ID}`);
+    console.log('🚀 Starting Faceit account scraper for SHADI sheet...');
+    console.log('⚡ REAL-TIME MODE: Bots will be saved immediately when found!');
+    console.log(`🔑 Using Faceit API key: ${FACEIT_API_KEY.slice(0, 5)}...`);
+    console.log(`📋 Using spreadsheet ID: ${SPREADSHEET_ID}`);
 
     // Initialize Google Sheets
     console.log('Authenticating with Google...');
@@ -312,7 +398,7 @@ async function main() {
 
     // Search for each pattern with different number ranges
     for (const basePattern of BASE_PATTERNS) {
-      console.log(`Processing base pattern: ${basePattern}`);
+      console.log(`\n🔍 ======= PROCESSING BASE PATTERN: ${basePattern} =======`);
 
       // Define number ranges to search in batches
       const numberRanges = ['', '*']; // Empty string for general search, * as wildcard
@@ -329,7 +415,7 @@ async function main() {
 
         if (validBotsCount > 0) {
           totalAccountsFound += validBotsCount;
-          console.log(`Found ${validBotsCount} valid bot accounts for ${basePattern}_${numberRange}`);
+          console.log(`✨ Found ${validBotsCount} valid bot accounts for ${basePattern}_${numberRange}`);
         }
 
         // Add a delay between searches to respect rate limits
@@ -337,27 +423,15 @@ async function main() {
       }
     }
 
-    // Flush any remaining accounts in the buffer
-    if (batchBuffer.length > 0) {
-      await writeBufferedAccountsToSheet(sheetsClient);
-    }
+    // Flush any remaining accounts in the buffer (not needed with immediate saving)
+    // All accounts are saved immediately when found
 
-    console.log(`Completed! Found and saved ${totalAccountsFound} unique bot accounts total.`);
-    console.log(`Total accounts in spreadsheet: ${totalAccountsSaved}`);
+    console.log(`\n🎉 COMPLETED! Found and saved ${totalAccountsFound} unique bot accounts total.`);
+    console.log(`📊 Total accounts in spreadsheet: ${totalAccountsSaved}`);
 
   } catch (error) {
-    console.error('Error in main process:', error);
-
-    // Try to save any remaining accounts in the buffer
-    try {
-      if (batchBuffer.length > 0) {
-        const sheetsClient = await getGoogleSheetsClient();
-        await writeBufferedAccountsToSheet(sheetsClient);
-        console.log('Saved remaining accounts before exit.');
-      }
-    } catch (finalSaveError) {
-      console.error('Error in final save attempt:', finalSaveError);
-    }
+    console.error('❌ Error in main process:', error);
+    // All accounts are saved immediately, so no need for final save attempt
   }
 }
 
